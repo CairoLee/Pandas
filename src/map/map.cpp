@@ -1732,7 +1732,7 @@ TIMER_FUNC(map_clearflooritem_timer){
 	if (pet_db_search(fitem->item.nameid, PET_EGG))
 		intif_delete_petdata(MakeDWord(fitem->item.card[1], fitem->item.card[2]));
 
-	clif_clearflooritem(fitem, 0);
+	clif_clearflooritem( *fitem );
 	map_deliddb(&fitem->bl);
 	map_delblock(&fitem->bl);
 	map_freeblock(&fitem->bl);
@@ -1748,7 +1748,7 @@ void map_clearflooritem(struct block_list *bl) {
 	if( fitem->cleartimer != INVALID_TIMER )
 		delete_timer(fitem->cleartimer,map_clearflooritem_timer);
 
-	clif_clearflooritem(fitem, 0);
+	clif_clearflooritem( *fitem );
 	map_deliddb(&fitem->bl);
 	map_delblock(&fitem->bl);
 	map_freeblock(&fitem->bl);
@@ -1809,9 +1809,9 @@ static int map_count_sub(struct block_list *bl,va_list ap)
  * &2 = the target should be able to walk to the target tile.
  * &4 = there shouldn't be any players around the target tile (use the no_spawn_on_player setting)
  *------------------------------------------*/
-int map_search_freecell(struct block_list *src, int16 m, int16 *x,int16 *y, int16 rx, int16 ry, int flag)
+int map_search_freecell(struct block_list *src, int16 m, int16 *x, int16 *y, int16 rx, int16 ry, int flag, int32 tries)
 {
-	int tries, spawn=0;
+	int spawn=0;
 	int bx, by;
 
 	if( !src && (!(flag&1) || flag&2) )
@@ -1841,20 +1841,22 @@ int map_search_freecell(struct block_list *src, int16 m, int16 *x,int16 *y, int1
 		return 0;
 	}
 
-	if (rx >= 0 && ry >= 0) {
-		tries = (rx * 2 + 1) * (ry * 2 + 1);
-		if (tries > 100) tries = 100;
-	} else {
-		tries = mapdata->xs*mapdata->ys;
-		if (tries > 500) tries = 500;
-	}
-
+	int16 edge = battle_config.map_edge_size;
+	int16 edge_valid = std::min(edge, (int16)5);
+	// In most situations there are 50 tries officially (default value)
 	while(tries--) {
-		*x = (rx >= 0) ? rnd_value(bx - rx, bx + rx) : rnd_value<int16>(1, mapdata->xs - 1);
-		*y = (ry >= 0) ? rnd_value(by - ry, by + ry) : rnd_value<int16>(1, mapdata->ys - 1);
+		// For map-wide search, the configured tiles from the edge are not considered (default: 15)
+		*x = (rx >= 0) ? rnd_value(bx - rx, bx + rx) : rnd_value<int16>(edge, mapdata->xs - edge - 1);
+		*y = (ry >= 0) ? rnd_value(by - ry, by + ry) : rnd_value<int16>(edge, mapdata->ys - edge - 1);
 
 		if (*x == bx && *y == by)
 			continue; //Avoid picking the same target tile.
+
+		// Cells outside the map or within 4-5 cells of the map edge are considered invalid officially
+		// Note that unlike the other edge, this isn't symmetric (NE - 4 cells, SW - 5 cells)
+		// If for some reason edge size was set to below 5 cells, we consider them as valid
+		if (*x < edge_valid || *x > mapdata->xs - edge_valid || *y < edge_valid || *y > mapdata->ys - edge_valid)
+			continue;
 
 		if (map_getcell(m,*x,*y,CELL_CHKREACH))
 		{
@@ -1864,10 +1866,11 @@ int map_search_freecell(struct block_list *src, int16 m, int16 *x,int16 *y, int1
 				if (spawn >= 100) return 0; //Limit of retries reached.
 				if (spawn++ < battle_config.no_spawn_on_player &&
 					map_foreachinallarea(map_count_sub, m,
-						*x-AREA_SIZE, *y-AREA_SIZE,
-					  	*x+AREA_SIZE, *y+AREA_SIZE, BL_PC)
-				)
-				continue;
+						*x - AREA_SIZE, *y - AREA_SIZE,
+						*x + AREA_SIZE, *y + AREA_SIZE, BL_PC)) {
+					tries++; // This failure should not affect the number of official tries
+					continue;
+				}
 			}
 			return 1;
 		}
@@ -2280,7 +2283,7 @@ int map_quit(map_session_data *sd) {
 
 	pc_itemcd_do(sd,false);
 
-	npc_script_event(sd, NPCE_LOGOUT);
+	npc_script_event( *sd, NPCE_LOGOUT );
 
 	//Unit_free handles clearing the player related data,
 	//map_quit handles extra specific data which is related to quitting normally
@@ -2318,7 +2321,9 @@ int map_quit(map_session_data *sd) {
 	}
 
 	// Return loot to owner
-	if( sd->pd ) pet_lootitem_drop(sd->pd, sd);
+	if( sd->pd != nullptr ){
+		pet_lootitem_drop( *sd->pd, sd );
+	}
 
 	if (sd->ed) // Remove effects here rather than unit_remove_map_pc so we don't clear on Teleport/map change.
 		elemental_clean_effect(sd->ed);
@@ -4158,7 +4163,7 @@ int map_readgat (struct map_data* m)
 
 	sprintf(filename, "data\\%s.gat", m->name);
 
-	gat = (uint8 *) grfio_read(filename);
+	gat = (uint8 *) grfio_reads(filename);
 	if (gat == nullptr)
 		return 0;
 
@@ -5092,7 +5097,8 @@ enum e_mapflag map_getmapflag_by_name(char* name)
 bool map_getmapflag_name( enum e_mapflag mapflag, char* output ){
 	const char* constant;
 	const char* prefix = "mf_";
-	int i, len = strlen(prefix);
+	size_t i;
+	size_t len = strlen( prefix );
 
 	// Look it up
 	constant = script_get_constant_str( prefix, mapflag );

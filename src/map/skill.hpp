@@ -189,10 +189,6 @@ enum e_skill_unit_flag : uint8 {
 	UF_MAX,
 };
 
-/// Walk intervals at which chase-skills are attempted to be triggered.
-/// If you change this, make sure it's an odd value (for icewall block behavior).
-#define WALK_SKILL_INTERVAL 5
-
 /// Time that's added to canact delay on castbegin and substracted on castend
 /// This is to prevent hackers from sending a skill packet after cast but before a timer triggers castend
 const t_tick SECURITY_CASTTIME = 100;
@@ -545,7 +541,6 @@ int skill_get_hp( uint16 skill_id ,uint16 skill_lv );
 int skill_get_mhp( uint16 skill_id ,uint16 skill_lv );
 int skill_get_sp( uint16 skill_id ,uint16 skill_lv );
 int skill_get_ap( uint16 skill_id, uint16 skill_lv );
-int skill_get_status_count( uint16 skill_id );
 int skill_get_hp_rate( uint16 skill_id, uint16 skill_lv );
 int skill_get_sp_rate( uint16 skill_id, uint16 skill_lv );
 int skill_get_ap_rate( uint16 skill_id, uint16 skill_lv );
@@ -554,7 +549,7 @@ int skill_get_weapontype( uint16 skill_id );
 int skill_get_ammotype( uint16 skill_id );
 int skill_get_ammo_qty( uint16 skill_id, uint16 skill_lv );
 int skill_get_state(uint16 skill_id);
-int skill_get_status_count( uint16 skill_id );
+size_t skill_get_status_count( uint16 skill_id );
 int skill_get_spiritball( uint16 skill_id, uint16 skill_lv );
 unsigned short skill_dummy2skill_id(unsigned short skill_id);
 

@@ -717,7 +717,7 @@ int inter_accreg_fromsql(uint32 account_id, uint32 char_id, int fd, int type)
 		plen += 1;
 
 		safestrncpy(WFIFOCP(fd,plen), data, len);
-		plen += len;
+		plen += static_cast<decltype(plen)>( len );
 
 		Sql_GetData(sql_handle, 1, &data, nullptr);
 
@@ -731,7 +731,7 @@ int inter_accreg_fromsql(uint32 account_id, uint32 char_id, int fd, int type)
 		plen += 1;
 
 		safestrncpy(WFIFOCP(fd,plen), data, len);
-		plen += len;
+		plen += static_cast<decltype(plen)>( len );
 
 		WFIFOW(fd, 14) += 1;
 
@@ -797,7 +797,7 @@ int inter_accreg_fromsql(uint32 account_id, uint32 char_id, int fd, int type)
 		plen += 1;
 
 		safestrncpy(WFIFOCP(fd,plen), data, len);
-		plen += len;
+		plen += static_cast<decltype(plen)>( len );
 
 		Sql_GetData(sql_handle, 1, &data, nullptr);
 
@@ -1076,7 +1076,9 @@ void inter_final(void)
  * @param fd
  **/
 void inter_Storage_sendInfo(int fd) {
-	int size = sizeof(struct s_storage_table), len = 4 + interServerDb.size() * size, offset;
+	size_t offset = 4;
+	size_t size = sizeof( struct s_storage_table );
+	size_t len = offset + interServerDb.size() * size;
 #ifdef Pandas_Unlock_Storage_Capacity_Limit
 	// 由于 len 发送 2 字节已经无法满足需求, 因此下面的 WFIFOW 需提升为 WFIFOL
 	// 但如果需要提升则整个封包长度需要额外增加 2 个字节, 因此 len 需要增加 2
@@ -1086,11 +1088,12 @@ void inter_Storage_sendInfo(int fd) {
 	// Send storage table information
 	WFIFOHEAD(fd, len);
 	WFIFOW(fd, 0) = 0x388c;
+
 #ifndef Pandas_Unlock_Storage_Capacity_Limit
-	WFIFOW(fd, 2) = len;
+	WFIFOW( fd, 2 ) = static_cast<int16>( len );
 	offset = 4;
 #else
-	WFIFOL(fd, 2) = len;
+	WFIFOL( fd, 2 ) = static_cast<int32>( len );
 	offset = 4 + 2;
 #endif // Pandas_Unlock_Storage_Capacity_Limit
 	for( auto storage : interServerDb ){
@@ -1354,7 +1357,7 @@ int mapif_parse_Registry(int fd)
 			size_t lenkey = RFIFOB( fd, cursor );
 			const char* src_key= RFIFOCP(fd, cursor + 1);
 			std::string key( src_key, lenkey );
-			cursor += lenkey + 1;
+			cursor += static_cast<decltype(cursor)>( lenkey + 1 );
 
 			uint32  index = RFIFOL(fd, cursor);
 			cursor += 4;
@@ -1374,7 +1377,7 @@ int mapif_parse_Registry(int fd)
 					size_t len_val = RFIFOB( fd, cursor );
 					const char* src_val= RFIFOCP(fd, cursor + 1);
 					std::string sval( src_val, len_val );
-					cursor += len_val + 1;
+					cursor += static_cast<decltype(cursor)>( len_val + 1 );
 					inter_savereg( account_id, char_id, key.c_str(), index, 0, sval.c_str(), true );
 					break;
 				}

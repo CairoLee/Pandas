@@ -953,6 +953,11 @@ Body:
   - Command: reloadbattleconf
     Help: |
       重新加载战斗配置选项
+  - Command: reloadcashdb
+    Aliases:
+      - reloadcashshop
+    Help: |
+      重新加载 Cash 商城数据库
   - Command: reloadinstancedb
     Help: |
       重新加载副本配置文件
@@ -1000,6 +1005,7 @@ Body:
       atcommand        battleconf         statusdb
       pcdb                   motd           script
       questdb             msgconf         packetdb
+      cashdb
 #  - Command: langtype
 #    Help: |
 #      参数: <语言简称>

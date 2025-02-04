@@ -53,8 +53,6 @@ using namespace rathena;
 
 #define ACTIVE_AI_RANGE 2	//Distance added on top of 'AREA_SIZE' at which mobs enter active AI mode.
 
-#define IDLE_SKILL_INTERVAL 10	//Active idle skills should be triggered every 1 second (1000/MIN_MOBTHINKTIME)
-
 const t_tick MOB_MAX_DELAY = 24 * 3600 * 1000;
 #define RUDE_ATTACKED_COUNT 1	//After how many rude-attacks should the skill be used?
 
@@ -90,9 +88,7 @@ struct s_mob_skill_db {
 
 std::unordered_map<int32, std::shared_ptr<s_mob_skill_db>> mob_skill_db; /// Monster skill temporary db. s_mob_skill_db -> mobid
 
-static struct eri *item_drop_ers; //For loot drops delay structures.
-static struct eri *item_drop_list_ers;
-
+std::unordered_map<uint32, std::shared_ptr<s_item_drop_list>> mob_delayed_drops;
 MobSummonDatabase mob_summon_db;
 MobChatDatabase mob_chat_db;
 MapDropDatabase map_drop_db;
@@ -254,7 +250,7 @@ void mvptomb_destroy(struct mob_data *md) {
 		int i;
 		struct map_data *mapdata = map_getmapdata(nd->bl.m);
 
-		clif_clearunit_area(&nd->bl,CLR_OUTSIGHT);
+		clif_clearunit_area( nd->bl, CLR_OUTSIGHT );
 		map_delblock(&nd->bl);
 
 		ARR_FIND( 0, mapdata->npc_num, i, mapdata->npc[i] == nd );
@@ -491,6 +487,8 @@ struct mob_data* mob_spawn_dataset(struct spawn_data *data)
 	md->spawn_timer = INVALID_TIMER;
 	md->deletetimer = INVALID_TIMER;
 	md->skill_idx = -1;
+	md->centerX = data->x;
+	md->centerY = data->y;
 	status_set_viewdata(&md->bl, md->mob_id);
 	status_change_init(&md->bl);
 	unit_dataset(&md->bl);
@@ -1136,11 +1134,12 @@ int mob_setdelayspawn(struct mob_data *md)
 int mob_count_sub(struct block_list *bl, va_list ap) {
     int mobid[10], i;
     ARR_FIND(0, 10, i, (mobid[i] = va_arg(ap, int)) == 0); //fetch till 0
-    if (mobid[0]) { //if there one let's check it otherwise go backward
-        TBL_MOB *md = BL_CAST(BL_MOB, bl);
+	mob_data* md = BL_CAST(BL_MOB, bl);
+	if (md && mobid[0]) { //if there one let's check it otherwise go backward
         ARR_FIND(0, 10, i, md->mob_id == mobid[i]);
         return (i < 10) ? 1 : 0;
     }
+	// If not counting monsters, count all
     return 1; //backward compatibility
 }
 
@@ -1168,20 +1167,33 @@ int mob_spawn (struct mob_data *md)
 
 	if (md->spawn) { //Respawn data
 		md->bl.m = md->spawn->m;
-		md->bl.x = md->spawn->x;
-		md->bl.y = md->spawn->y;
+		md->bl.x = md->centerX;
+		md->bl.y = md->centerY;
 
-		if( (md->bl.x == 0 && md->bl.y == 0) || md->spawn->xs || md->spawn->ys )
-		{	//Monster can be spawned on an area.
-			if( !map_search_freecell(&md->bl, -1, &md->bl.x, &md->bl.y, md->spawn->xs, md->spawn->ys, battle_config.no_spawn_on_player?4:0) )
-			{ // retry again later
-				if( md->spawn_timer != INVALID_TIMER )
-					delete_timer(md->spawn_timer, mob_delayspawn);
-				md->spawn_timer = add_timer(tick + battle_config.mob_respawn_time,mob_delayspawn,md->bl.id,0);
-				return 1;
+		// Search can be skipped for boss monster spawns if spawn location is fixed
+		// We can't skip normal monsters as they should pick a random location if the cell is blocked (e.g. Icewall)
+		// The center cell has a 1/(xs*ys) chance to be picked if free
+		if ((!md->spawn->state.boss || (md->bl.x == 0 && md->bl.y == 0) || md->spawn->xs != 1 || md->spawn->ys != 1)
+			&& (md->spawn->xs + md->spawn->ys < 1 || !rnd_chance(1, md->spawn->xs * md->spawn->ys) || !map_getcell(md->bl.m, md->bl.x, md->bl.y, CELL_CHKREACH)))
+		{
+			// Officially the area is split into 4 squares, 4 lines and 1 dot and for each of those there is one attempt
+			// We simplify this to trying 8 times in the whole area and then at the center cell even though that's not fully accurate
+
+			// Try to spawn monster in defined area (8 tries)
+			if (!map_search_freecell(&md->bl, -1, &md->bl.x, &md->bl.y, md->spawn->xs-1, md->spawn->ys-1, battle_config.no_spawn_on_player?4:0, 8))
+			{
+				// If area search failed and center cell not reachable, try to spawn the monster anywhere on the map (50 tries)
+				if (!map_getcell(md->bl.m, md->bl.x, md->bl.y, CELL_CHKREACH) && !map_search_freecell(&md->bl, -1, &md->bl.x, &md->bl.y, -1, -1, battle_config.no_spawn_on_player?4:0))
+				{
+					// Retry again later
+					if (md->spawn_timer != INVALID_TIMER)
+						delete_timer(md->spawn_timer, mob_delayspawn);
+					md->spawn_timer = add_timer(tick + battle_config.mob_respawn_time, mob_delayspawn, md->bl.id, 0);
+					return 1;
+				}
 			}
 		}
-		else if( battle_config.no_spawn_on_player > 99 && map_foreachinallrange(mob_count_sub, &md->bl, AREA_SIZE, BL_PC) )
+		if( battle_config.no_spawn_on_player > 99 && map_foreachinallrange(mob_count_sub, &md->bl, AREA_SIZE, BL_PC) )
 		{ // retry again later (players on sight)
 			if( md->spawn_timer != INVALID_TIMER )
 				delete_timer(md->spawn_timer, mob_delayspawn);
@@ -1215,6 +1227,7 @@ int mob_spawn (struct mob_data *md)
 	md->dmgtick = tick - 5000;
 	md->last_pcneartime = 0;
 	md->last_canmove = tick;
+	md->last_skillcheck = 0;
 
 	t_tick c = tick - MOB_MAX_DELAY;
 
@@ -1553,8 +1566,17 @@ static int mob_ai_sub_hard_slavemob(struct mob_data *md,t_tick tick)
 			}
 		}
 
-		if(md->target_id) //Slave is busy with a target.
-			return 0;
+		// Slave is busy with a target.
+		if(md->target_id) {
+			// Player's slave should come back when master's too far, even if it is doing with a target.
+			if (bl->type == BL_PC && md->master_dist > 5) {
+				mob_unlocktarget(md, tick);
+				unit_walktobl(&md->bl, bl, MOB_SLAVEDISTANCE, 1);
+				return 1;
+			} else {
+				return 0;
+			}
+		}
 
 		// Approach master if within view range, chase back to Master's area also if standing on top of the master.
 		if ((md->master_dist > MOB_SLAVEDISTANCE || md->master_dist == 0) && unit_can_move(&md->bl)) {
@@ -1630,14 +1652,17 @@ int mob_unlocktarget(struct mob_data *md, t_tick tick)
 			break;
 		}
 		// Idle skill.
-		if (!(++md->ud.walk_count%IDLE_SKILL_INTERVAL) && mobskill_use(md, tick, -1))
+		if (DIFF_TICK(tick, md->last_skillcheck) >= MOB_SKILL_INTERVAL && mobskill_use(md, tick, -1))
 			break;
 		//Random walk.
 		if (!md->master_id &&
 			DIFF_TICK(md->next_walktime, tick) <= 0 &&
 			!mob_randomwalk(md,tick))
 			//Delay next random walk when this one failed.
-			md->next_walktime = tick+rnd()%1000;
+			if (md->next_walktime < md->ud.canmove_tick)
+				md->next_walktime = md->ud.canmove_tick;
+			else
+				md->next_walktime = tick+rnd()%1000;
 		break;
 	default:
 		mob_stop_attack(md);
@@ -1671,8 +1696,7 @@ int mob_unlocktarget(struct mob_data *md, t_tick tick)
 int mob_randomwalk(struct mob_data *md,t_tick tick)
 {
 	const int d=7;
-	int i,c,r,rdir,dx,dy,max;
-	int speed;
+	int i,r,rdir,dx,dy,max;
 
 	nullpo_ret(md);
 
@@ -1756,16 +1780,9 @@ int mob_randomwalk(struct mob_data *md,t_tick tick)
 		}
 		return 0;
 	}
-	speed=status_get_speed(&md->bl);
-	for(i=c=0;i<md->ud.walkpath.path_len;i++){	// The next walk start time is calculated.
-		if( direction_diagonal( md->ud.walkpath.path[i] ) )
-			c+=speed*MOVE_DIAGONAL_COST/MOVE_COST;
-		else
-			c+=speed;
-	}
 	md->state.skillstate=MSS_WALK;
 	md->move_fail_count=0;
-	md->next_walktime = tick+rnd()%1000+MIN_RANDOMWALKTIME+c;
+	md->next_walktime = tick+rnd()%1000+MIN_RANDOMWALKTIME + unit_get_walkpath_time(md->bl);
 	return 1;
 }
 
@@ -2025,8 +2042,23 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 		return true;
 	}
 
-	//Attempt to attack.
-	//At this point we know the target is attackable, we just gotta check if the range matches.
+	// At this point we know the target is attackable, attempt to attack
+
+	// Monsters in angry state, after having used a normal attack, will always attempt a skill
+	if (md->ud.walktimer == INVALID_TIMER && md->state.skillstate == MSS_ANGRY && md->ud.skill_id == 0)
+	{
+		// Only use skill if able to walk on next tick and not attempted a skill the last second
+		if (DIFF_TICK(md->ud.canmove_tick, tick) <= MIN_MOBTHINKTIME && DIFF_TICK(tick, md->last_skillcheck) >= MOB_SKILL_INTERVAL){
+			if (mobskill_use(md, tick, -1)) {
+				// After the monster used an angry skill, it will not attack for aDelay
+				// Setting the delay here because not all monster skill use situations will cause an attack delay
+				md->ud.attackabletime = tick + md->status.adelay;
+				return true;
+			}
+		}
+	}
+
+	// Normal attack / berserk skill is only used when target is in range
 	if (battle_check_range(&md->bl, tbl, md->status.rhw.range) && !(md->sc.option&OPTION_HIDE))
 	{	//Target within range and able to use normal attack, engage
 		if (md->ud.target != tbl->id || md->ud.attacktimer == INVALID_TIMER) 
@@ -2046,16 +2078,6 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 			}
 		}
 		return true;
-	}
-
-	//Monsters in berserk state, unable to use normal attacks, will always attempt a skill
-	if(md->ud.walktimer == INVALID_TIMER && (md->state.skillstate == MSS_BERSERK || md->state.skillstate == MSS_ANGRY)) 
-	{
-		if (DIFF_TICK(md->ud.canmove_tick, tick) <= MIN_MOBTHINKTIME && DIFF_TICK(md->ud.canact_tick, tick) < -MIN_MOBTHINKTIME*IDLE_SKILL_INTERVAL) 
-		{ //Only use skill if able to walk on next tick and not used a skill the last second
-			if (mobskill_use(md, tick, -1))
-				return true;
-		}
 	}
 
 	//Target still in attack range, no need to chase the target
@@ -2079,7 +2101,7 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 			else {
 				// Use idle skill but keep target for now
 				md->state.skillstate = MSS_IDLE;
-				if (!(++md->ud.walk_count%IDLE_SKILL_INTERVAL))
+				if (DIFF_TICK(tick, md->last_skillcheck) >= MOB_SKILL_INTERVAL)
 					mobskill_use(md, tick, -1);
 			}
 		}
@@ -2094,10 +2116,24 @@ static bool mob_ai_sub_hard(struct mob_data *md, t_tick tick)
 		return true;
 
 	//Follow up if possible.
-	//Hint: Chase skills are handled in the walktobl routine
-	if(!mob_can_reach(md, tbl, md->min_chase) ||
-		!unit_walktobl(&md->bl, tbl, md->status.rhw.range, 2))
-		mob_unlocktarget(md,tick);
+	if (!mob_can_reach(md, tbl, md->min_chase)) {
+		mob_unlocktarget(md, tick);
+		return true;
+	}
+	// Monsters can use chase skills before starting to walk
+	// So we need to change the state and check for a skill here already
+	// But only use skill if able to walk on next tick and not attempted a skill the last second
+	// Skills during movement are handled in the walktobl routine
+	if (md->ud.walktimer == INVALID_TIMER
+		&& DIFF_TICK(md->ud.canmove_tick, tick) <= MIN_MOBTHINKTIME
+		&& DIFF_TICK(tick, md->last_skillcheck) >= MOB_SKILL_INTERVAL) {
+		md->state.skillstate = md->state.aggressive ? MSS_FOLLOW : MSS_RUSH;
+		if (mobskill_use(md, tick, -1))
+			return true;
+	}
+
+	if(!unit_walktobl(&md->bl, tbl, md->status.rhw.range, 2))
+		mob_unlocktarget(md, tick);
 
 	return true;
 }
@@ -2171,12 +2207,19 @@ static int mob_ai_sub_lazy(struct mob_data *md, va_list args)
 	//Clean the spotted log
 	mob_clean_spotted(md);
 
-	if(DIFF_TICK(tick,md->last_thinktime)< 10*MIN_MOBTHINKTIME)
+	if(DIFF_TICK(tick,md->last_thinktime) < MOB_SKILL_INTERVAL)
 		return 0;
 
 	md->last_thinktime=tick;
 
 	if (md->master_id) {
+		if (!mob_is_spotted(md)) {
+			// Get mob data of master
+			mob_data* mmd = map_id2md(md->master_id);
+			// If neither master nor slave have been spotted we don't have to execute the slave AI
+			if (mmd && !mob_is_spotted(mmd))
+				return 0;
+		}
 		mob_ai_sub_hard_slavemob (md,tick);
 		return 0;
 	}
@@ -2239,52 +2282,48 @@ static TIMER_FUNC(mob_ai_hard){
  * @param mobdrop: Drop data
  * @author [Cydh]
  **/
-void mob_setdropitem_option(item *item, s_mob_drop *mobdrop) {
-	if (!item || !mobdrop)
-		return;
-
-	std::shared_ptr<s_random_opt_group> group = random_option_group.find(mobdrop->randomopt_group);
+void mob_setdropitem_option( item& item, s_mob_drop& mobdrop ){
+	std::shared_ptr<s_random_opt_group> group = random_option_group.find( mobdrop.randomopt_group );
 
 	if (group != nullptr) {
-		group->apply( *item );
+		group->apply( item );
 	}
 }
 
 /*==========================================
  * Initializes the delay drop structure for mob-dropped items.
  *------------------------------------------*/
-static struct item_drop* mob_setdropitem(struct s_mob_drop *mobdrop, int qty, unsigned short mob_id)
-{
-	struct item_drop *drop = ers_alloc(item_drop_ers, struct item_drop);
-	memset(&drop->item_data, 0, sizeof(struct item));
-	drop->item_data.nameid = mobdrop->nameid;
+static std::shared_ptr<s_item_drop> mob_setdropitem( s_mob_drop& mobdrop, int qty, unsigned short mob_id ){
+	std::shared_ptr<s_item_drop> drop = std::make_shared<s_item_drop>();
+
+	drop->item_data = { 0 };
+	drop->item_data.nameid = mobdrop.nameid;
 	drop->item_data.amount = qty;
-	drop->item_data.identify = itemdb_isidentified(mobdrop->nameid);
+	drop->item_data.identify = itemdb_isidentified( mobdrop.nameid );
 #ifdef Pandas_BattleConfig_Force_Identified
 	drop->item_data.identify = (battle_config.force_identified & 2 ? 1 : drop->item_data.identify);
 #endif // Pandas_BattleConfig_Force_Identified
-	mob_setdropitem_option(&drop->item_data, mobdrop);
+	mob_setdropitem_option( drop->item_data, mobdrop );
 	drop->mob_id = mob_id;
-	drop->next = nullptr;
+
 	return drop;
 }
 
 /*==========================================
  * Initializes the delay drop structure for mob-looted items.
  *------------------------------------------*/
-static struct item_drop* mob_setlootitem(struct s_mob_lootitem *item, unsigned short mob_id)
-{
-	struct item_drop *drop = ers_alloc(item_drop_ers, struct item_drop);
-	memcpy(&drop->item_data, item, sizeof(struct item));
+static std::shared_ptr<s_item_drop> mob_setlootitem( s_mob_lootitem& item, unsigned short mob_id ){
+	std::shared_ptr<s_item_drop> drop = std::make_shared<s_item_drop>();
+
+	memcpy( &drop->item_data, &item, sizeof( struct item ) );
 
 	/**
-	 * Conditions for lotted item, so it can be announced when player pick it up
+	 * Conditions for looted item, so it can be announced when player pick it up
 	 * 1. Not-dropped other than monster. (This will be done later on pc_takeitem/party_share_loot)
-	 * 2. The mob_id is become the last lootter, instead of the real monster who drop it.
+	 * 2. The mob_id becomes the last looter, instead of the real monster who drop it.
 	 **/
-	drop->mob_id = item->mob_id;
+	drop->mob_id = item.mob_id;
 
-	drop->next = nullptr;
 	return drop;
 }
 
@@ -2292,23 +2331,21 @@ static struct item_drop* mob_setlootitem(struct s_mob_lootitem *item, unsigned s
  * item drop with delay (timer function)
  *------------------------------------------*/
 static TIMER_FUNC(mob_delay_item_drop){
-	struct item_drop_list *list;
-	struct item_drop *ditem;
+	uint32 bl_id = static_cast<uint32>( id );
+	std::shared_ptr<s_item_drop_list> list = util::umap_find( mob_delayed_drops, bl_id );
 
-	list = (struct item_drop_list *)data;
-	ditem = list->item;
+	if( list == nullptr ){
+		return 0;
+	}
 
-	while (ditem) {
-		struct item_drop *ditem_prev;
+	for( std::shared_ptr<s_item_drop>& ditem : list->items ){
 		map_addflooritem(&ditem->item_data,ditem->item_data.amount,
 			list->m,list->x,list->y,
 			list->first_charid,list->second_charid,list->third_charid,4,ditem->mob_id,true);
-		ditem_prev = ditem;
-		ditem = ditem->next;
-		ers_free(item_drop_ers, ditem_prev);
 	}
 
-	ers_free(item_drop_list_ers, list);
+	mob_delayed_drops.erase( bl_id );
+
 	return 0;
 }
 
@@ -2318,7 +2355,7 @@ static TIMER_FUNC(mob_delay_item_drop){
  * rate is the drop-rate of the item, required for autoloot.
  * flag : Killed only by homunculus/mercenary?
  *------------------------------------------*/
-static void mob_item_drop(struct mob_data *md, struct item_drop_list *dlist, struct item_drop *ditem, int loot, int drop_rate, bool flag)
+static void mob_item_drop(struct mob_data *md, std::shared_ptr<s_item_drop_list>& dlist, std::shared_ptr<s_item_drop>& ditem, int loot, int drop_rate, bool flag)
 {
 	TBL_PC* sd;
 	bool test_autoloot;
@@ -2350,12 +2387,11 @@ static void mob_item_drop(struct mob_data *md, struct item_drop_list *dlist, str
 		if (party_share_loot(party_search(sd->status.party_id),
 			sd, &ditem->item_data, sd->status.char_id) == 0
 		) {
-			ers_free(item_drop_ers, ditem);
 			return;
 		}
 	}
-	ditem->next = dlist->item;
-	dlist->item = ditem;
+
+	dlist->items.push_back( ditem );
 }
 
 TIMER_FUNC(mob_timer_delete){
@@ -2959,20 +2995,20 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 		(md->special_state.ai==AI_SPHERE && battle_config.alchemist_summon_reward == 1) //Marine Sphere Drops items.
 		) )
 	{ // Item Drop
-		struct item_drop_list *dlist = ers_alloc(item_drop_list_ers, struct item_drop_list);
-		struct item_drop *ditem;
 		int drop_rate, drop_modifier = 100;
 
 #ifdef RENEWAL_DROP
 		drop_modifier = pc_level_penalty_mod( mvp_sd != nullptr ? mvp_sd : second_sd != nullptr ? second_sd : third_sd, PENALTY_DROP, nullptr, md );
 #endif
+
+		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
+
 		dlist->m = md->bl.m;
 		dlist->x = md->bl.x;
 		dlist->y = md->bl.y;
 		dlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
 		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
 		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
-		dlist->item = nullptr;
 
 		for (i = 0; i < MAX_MOB_DROP_TOTAL; i++) {
 			if (md->db->dropitem[i].nameid == 0)
@@ -3005,7 +3041,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 				continue;
 			}
 
-			ditem = mob_setdropitem(&md->db->dropitem[i], 1, md->mob_id);
+			std::shared_ptr<s_item_drop> ditem = mob_setdropitem( md->db->dropitem[i], 1, md->mob_id );
 
 #ifdef Pandas_Item_Special_Annouce
 			bool is_spceial_annouced = false;
@@ -3039,9 +3075,12 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 
 		// Ore Discovery [Celest]
 		if (sd == mvp_sd && pc_checkskill(sd,BS_FINDINGORE)>0 && battle_config.finding_ore_rate/10 >= rnd()%10000) {
-			struct s_mob_drop mobdrop = {};
-			mobdrop.nameid = itemdb_group.get_random_item_id(IG_FINDINGORE,1);
-			ditem = mob_setdropitem(&mobdrop, 1, md->mob_id);
+			s_mob_drop mobdrop = {};
+
+			mobdrop.nameid = itemdb_group.get_random_item_id(IG_FINDINGORE, 1);
+
+			std::shared_ptr<s_item_drop> ditem = mob_setdropitem(mobdrop, 1, md->mob_id);
+
 #ifdef Pandas_NpcExpress_MOBDROPITEM
 			if (npc_express_aide_mobdropitem(md, src, dlist, mobdrop.nameid, battle_config.finding_ore_rate / 10, 2))
 #endif // Pandas_NpcExpress_MOBDROPITEM
@@ -3073,7 +3112,9 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 					if (rnd()%10000 >= drop_rate)
 						continue;
 					dropid = (it.nameid > 0) ? it.nameid : itemdb_group.get_random_item_id(it.group,1);
-					struct s_mob_drop mobdrop = {};
+
+					s_mob_drop mobdrop = {};
+
 					mobdrop.nameid = dropid;
 
 #ifdef Pandas_NpcExpress_MOBDROPITEM
@@ -3081,7 +3122,9 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 						continue;
 #endif // Pandas_NpcExpress_MOBDROPITEM
 
-					mob_item_drop(md, dlist, mob_setdropitem(&mobdrop,1,md->mob_id), 0, drop_rate, homkillonly || merckillonly);
+					std::shared_ptr<s_item_drop> ditem = mob_setdropitem(mobdrop, 1, md->mob_id);
+
+					mob_item_drop( md, dlist, ditem, 0, drop_rate, homkillonly || merckillonly );
 				}
 			}
 
@@ -3096,13 +3139,17 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 		// process items looted by the mob
 		if (md->lootitems) {
 #ifndef Pandas_NpcExpress_MOBDROPITEM
-			for (i = 0; i < md->lootitem_count; i++)
-				mob_item_drop(md, dlist, mob_setlootitem(&md->lootitems[i], md->mob_id), 1, 10000, homkillonly || merckillonly);
+			for (i = 0; i < md->lootitem_count; i++) {
+				std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+
+				mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
 #else
 			for (i = 0; i < md->lootitem_count; i++) {
 				if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->lootitems[i].item.nameid, 10000, 4))
 					continue;
-				mob_item_drop(md, dlist, mob_setlootitem(&md->lootitems[i], md->mob_id), 1, 10000, homkillonly || merckillonly);
+
+				std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+				mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
 			}
 #endif // Pandas_NpcExpress_MOBDROPITEM
 		}
@@ -3123,7 +3170,8 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 				if( rnd_chance( it.second->rate, 100000u ) ){
 					// 'Cheat' for autoloot command: rate is changed from n/100000 to n/10000
 					int32 map_drops_rate = max(1, (it.second->rate / 10));
-					mob_item_drop( md, dlist, mob_setdropitem( it.second.get(), 1, md->mob_id ), 0, map_drops_rate, (homkillonly || merckillonly) );
+					std::shared_ptr<s_item_drop> ditem = mob_setdropitem(*it.second, 1, md->mob_id);
+					mob_item_drop( md, dlist, ditem, 0, map_drops_rate, homkillonly || merckillonly );
 				}
 			}
 
@@ -3135,36 +3183,46 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 					if( rnd_chance( it.second->rate, 100000u ) ){
 						// 'Cheat' for autoloot command: rate is changed from n/100000 to n/10000
 						int32 map_drops_rate = max(1, (it.second->rate / 10));
-						mob_item_drop( md, dlist, mob_setdropitem( it.second.get(), 1, md->mob_id ), 0, map_drops_rate, (homkillonly || merckillonly) );
+						std::shared_ptr<s_item_drop> ditem = mob_setdropitem(*it.second, 1, md->mob_id);
+						mob_item_drop( md, dlist, ditem, 0, map_drops_rate, homkillonly || merckillonly );
 					}
 				}
 			}
 		}
 
-		if (dlist->item) //There are drop items.
-			add_timer(tick + (!battle_config.delay_battle_damage?500:0), mob_delay_item_drop, 0, (intptr_t)dlist);
-		else //No drops
-			ers_free(item_drop_list_ers, dlist);
+		// There are drop items.
+		if( !dlist->items.empty() ){
+			mob_delayed_drops[md->bl.id] = dlist;
+
+			add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
+		}
 	} else if (md->lootitems && md->lootitem_count) {	//Loot MUST drop!
-		struct item_drop_list *dlist = ers_alloc(item_drop_list_ers, struct item_drop_list);
+		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
+
 		dlist->m = md->bl.m;
 		dlist->x = md->bl.x;
 		dlist->y = md->bl.y;
 		dlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
 		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
 		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
-		dlist->item = nullptr;
+
 #ifndef Pandas_NpcExpress_MOBDROPITEM
-		for (i = 0; i < md->lootitem_count; i++)
-			mob_item_drop(md, dlist, mob_setlootitem(&md->lootitems[i], md->mob_id), 1, 10000, homkillonly || merckillonly);
+		for (i = 0; i < md->lootitem_count; i++) {
+			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+
+			mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
 #else
 		for (i = 0; i < md->lootitem_count; i++) {
 			if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->lootitems[i].item.nameid, 10000, 4))
 				continue;
-			mob_item_drop(md, dlist, mob_setlootitem(&md->lootitems[i], md->mob_id), 1, 10000, homkillonly || merckillonly);
+
+			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+			mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
 		}
 #endif // Pandas_NpcExpress_MOBDROPITEM
-		add_timer(tick + (!battle_config.delay_battle_damage?500:0), mob_delay_item_drop, 0, (intptr_t)dlist);
+
+		mob_delayed_drops[md->bl.id] = dlist;
+		add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
 	}
 
 	if( mvp_sd && md->get_bosstype() == BOSSTYPE_MVP ){
@@ -3288,7 +3346,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 					intif_broadcast(message,strlen(message)+1,BC_DEFAULT);
 				}
 
-				mob_setdropitem_option(&item, &mdrop[i]);
+				mob_setdropitem_option( item, mdrop[i] );
 
 				if((temp = pc_additem(mvp_sd,&item,1,LOG_TYPE_PICKDROP_PLAYER)) != 0) {
 					clif_additem(mvp_sd,0,0,temp);
@@ -3378,7 +3436,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 		} else if( mvp_sd && !md->state.npc_killmonster ) {
 			pc_setparam(mvp_sd, SP_KILLEDGID, md->bl.id);
 			pc_setparam(mvp_sd, SP_KILLEDRID, md->mob_id);
-			npc_script_event(mvp_sd, NPCE_KILLNPC); // PCKillNPC [Lance]
+			npc_script_event( *mvp_sd, NPCE_KILLNPC );
 		}
 
 #ifdef Pandas_BattleConfig_AlwaysTriggerNPCKillEvent
@@ -3388,7 +3446,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 			!md->state.npc_killmonster && battle_config.always_trigger_npc_killevent) {
 			pc_setparam(mvp_sd, SP_KILLEDGID, md->bl.id);
 			pc_setparam(mvp_sd, SP_KILLEDRID, md->mob_id);
-			npc_script_event(mvp_sd, NPCE_KILLNPC);
+			npc_script_event(*mvp_sd, NPCE_KILLNPC);
 		}
 #endif // Pandas_BattleConfig_AlwaysTriggerNPCKillEvent
 
@@ -3435,7 +3493,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 
 		if( pcdb_checkid(md->vd->class_) ) {//Player mobs are not removed automatically by the client.
 			/* first we set them dead, then we delay the outsight effect */
-			clif_clearunit_area(&md->bl,CLR_DEAD);
+			clif_clearunit_area( md->bl, CLR_DEAD );
 			clif_clearunit_delayed(&md->bl, CLR_OUTSIGHT,tick+3000);
 		} else
 			/**
@@ -3772,6 +3830,33 @@ int mob_countslave(struct block_list *bl)
 	return map_foreachinmap(mob_countslave_sub, bl->m, BL_MOB,bl->id);
 }
 
+/**
+ * Remove slaves if master logs off.
+ * @param bl: Mob data
+ * @param ap: List of arguments
+ * @return 1 on removal, otherwise 0
+ */
+int mob_removeslaves_sub(block_list *bl, va_list ap) {
+	int id = va_arg(ap, int);
+	mob_data *md = (mob_data *)bl;
+
+	if (md != nullptr && md->master_id == id) {
+		unit_free(bl, CLR_OUTSIGHT);
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * Remove slaves on a map.
+ * @param bl: Player data
+ * @return 1 on removal, otherwise 0
+ */
+int mob_removeslaves(block_list *bl) {
+	return map_foreachinmap(mob_removeslaves_sub, bl->m, BL_MOB, bl->id);
+}
+
 /*==========================================
  * Summons amount slaves contained in the value[5] array using round-robin. [adapted by Skotlex]
  *------------------------------------------*/
@@ -4049,8 +4134,9 @@ int mobskill_use(struct mob_data *md, t_tick tick, int event, int64 damage)
 	if (!battle_config.mob_skill_rate || md->ud.skilltimer != INVALID_TIMER || ms.empty() || status_has_mode(&md->status,MD_NOCAST))
 		return 0;
 
-	if (event == -1 && DIFF_TICK(md->ud.canact_tick, tick) > 0)
-		return 0; //Skill act delay only affects non-event skills.
+	// Monsters check their non-attack-state skills once per second, but we ignore this for events for now
+	if (event == -1)
+		md->last_skillcheck = tick;
 
 	//Pick a starting position and loop from that.
 	i = battle_config.mob_ai&0x100?rnd()%ms.size():0;
@@ -4685,6 +4771,7 @@ s_mob_db::s_mob_db()
 	status.speed = DEFAULT_WALK_SPEED;
 	status.adelay = cap_value(0, battle_config.monster_max_aspd * 2, 4000);
 	status.amotion = cap_value(0, battle_config.monster_max_aspd, 2000);
+	status.clientamotion = cap_value(status.amotion, 1, USHRT_MAX);
 	status.mode = static_cast<e_mode>(MONSTER_TYPE_06);
 
 #ifdef Pandas_BattleConfig_MobDB_DamageMotion_Min
@@ -5129,6 +5216,18 @@ uint64 MobDatabase::parseBodyNode(const ryml::NodeRef& node) {
 		mob->status.amotion = cap_value(speed, battle_config.monster_max_aspd, 2000);
 	}
 
+	if (this->nodeExists(node, "ClientAttackMotion")) {
+		uint16 speed;
+
+		if (!this->asUInt16(node, "ClientAttackMotion", speed))
+			return 0;
+
+		mob->status.clientamotion = cap_value(speed, 1, USHRT_MAX);
+	} else {
+		if (!exists)
+			mob->status.clientamotion = cap_value(mob->status.amotion, 1, USHRT_MAX);
+	}
+
 	if (this->nodeExists(node, "DamageMotion")) {
 		uint16 speed;
 
@@ -5526,7 +5625,7 @@ static int mob_read_sqldb(void)
 	for( uint8 fi = 0; fi < ARRAYLENGTH(mob_db_name); ++fi ) {
 		// retrieve all rows from the mob database
 		if( SQL_ERROR == Sql_Query(mmysql_handle, "SELECT `id`,`name_aegis`,`name_english`,`name_japanese`,`level`,`hp`,`sp`,`base_exp`,`job_exp`,`mvp_exp`,`attack`,`attack2`,`defense`,`magic_defense`,`str`,`agi`,`vit`,`int`,`dex`,`luk`,`attack_range`,`skill_range`,`chase_range`,`size`,`race`,"
-			"`racegroup_goblin`,`racegroup_kobold`,`racegroup_orc`,`racegroup_golem`,`racegroup_guardian`,`racegroup_ninja`,`racegroup_gvg`,`racegroup_battlefield`,`racegroup_treasure`,`racegroup_biolab`,`racegroup_manuk`,`racegroup_splendide`,`racegroup_scaraba`,`racegroup_ogh_atk_def`,`racegroup_ogh_hidden`,`racegroup_bio5_swordman_thief`,`racegroup_bio5_acolyte_merchant`,`racegroup_bio5_mage_archer`,`racegroup_bio5_mvp`,`racegroup_clocktower`,`racegroup_thanatos`,`racegroup_faceworm`,`racegroup_hearthunter`,`racegroup_rockridge`,`racegroup_werner_lab`,`racegroup_temple_demon`,`racegroup_illusion_vampire`,`racegroup_malangdo`,`racegroup_ep172alpha`,`racegroup_ep172beta`,`racegroup_ep172bath`,`racegroup_illusion_turtle`,`racegroup_rachel_sanctuary`,`racegroup_illusion_luanda`,"
+			"`racegroup_goblin`,`racegroup_kobold`,`racegroup_orc`,`racegroup_golem`,`racegroup_guardian`,`racegroup_ninja`,`racegroup_gvg`,`racegroup_battlefield`,`racegroup_treasure`,`racegroup_biolab`,`racegroup_manuk`,`racegroup_splendide`,`racegroup_scaraba`,`racegroup_ogh_atk_def`,`racegroup_ogh_hidden`,`racegroup_bio5_swordman_thief`,`racegroup_bio5_acolyte_merchant`,`racegroup_bio5_mage_archer`,`racegroup_bio5_mvp`,`racegroup_clocktower`,`racegroup_thanatos`,`racegroup_faceworm`,`racegroup_hearthunter`,`racegroup_rockridge`,`racegroup_werner_lab`,`racegroup_temple_demon`,`racegroup_illusion_vampire`,`racegroup_malangdo`,`racegroup_ep172alpha`,`racegroup_ep172beta`,`racegroup_ep172bath`,`racegroup_illusion_turtle`,`racegroup_rachel_sanctuary`,`racegroup_illusion_luanda`,`racegroup_illusion_frozen`,`racegroup_illusion_moonlight`,"
 			"`element`,`element_level`,`walk_speed`,`attack_delay`,`attack_motion`,`damage_motion`,`damage_taken`,`ai`,`class`,"
 			"`mode_canmove`,`mode_looter`,`mode_aggressive`,`mode_assist`,`mode_castsensoridle`,`mode_norandomwalk`,`mode_nocast`,`mode_canattack`,`mode_castsensorchase`,`mode_changechase`,`mode_angry`,`mode_changetargetmelee`,`mode_changetargetchase`,`mode_targetweak`,`mode_randomtarget`,`mode_ignoremelee`,`mode_ignoremagic`,`mode_ignoreranged`,`mode_mvp`,`mode_ignoremisc`,`mode_knockbackimmune`,`mode_teleportblock`,`mode_fixeditemdrop`,`mode_detector`,`mode_statusimmune`,`mode_skillimmune`,"
 			"`mvpdrop1_item`,`mvpdrop1_rate`,`mvpdrop1_option`,`mvpdrop1_index`,`mvpdrop2_item`,`mvpdrop2_rate`,`mvpdrop2_option`,`mvpdrop2_index`,`mvpdrop3_item`,`mvpdrop3_rate`,`mvpdrop3_option`,`mvpdrop3_index`,"
@@ -6898,8 +6997,8 @@ static void mob_load(void)
 	mob_chat_db.load();	// load before mob_skill_db
 
 	for(int i = 0; i < ARRAYLENGTH(dbsubpath); i++){	
-		int n1 = strlen(db_path)+strlen(dbsubpath[i])+1;
-		int n2 = strlen(db_path)+strlen(DBPATH)+strlen(dbsubpath[i])+1;
+		size_t n1 = strlen( db_path ) + strlen( dbsubpath[i] ) + 1;
+		size_t n2 = strlen( db_path ) + strlen( DBPATH ) + strlen( dbsubpath[i] ) + 1;
 
 		char* dbsubpath1 = (char*)aMalloc(n1+1);
 		char* dbsubpath2 = (char*)aMalloc(n2+1);
@@ -6936,13 +7035,6 @@ static void mob_load(void)
  * Initialize monster data
  */
 void mob_db_load(bool is_reload){
-	if( !is_reload ) {
-		// on mobdbreload it's not neccessary to execute this
-		// item ers needs to be allocated only once
-		item_drop_ers = ers_new(sizeof(struct item_drop),"mob.cpp::item_drop_ers",ERS_OPT_CLEAN);
-		item_drop_list_ers = ers_new(sizeof(struct item_drop_list),"mob.cpp::item_drop_list_ers",ERS_OPT_NONE);
-	}
-
 #ifdef Pandas_Database_MobItem_FixedRatio
 	mobitem_fixedratio_db.load();
 #endif // Pandas_Database_MobItem_FixedRatio
@@ -7023,7 +7115,7 @@ static int mob_reload_sub( struct mob_data *md, va_list args ){
 		// If they are spawned right now
 		if( md->bl.prev != nullptr ){
 			// Respawn all mobs on client side so that they are displayed correctly(if their view id changed)
-			clif_clearunit_area(&md->bl, CLR_OUTSIGHT);
+			clif_clearunit_area( md->bl, CLR_OUTSIGHT );
 			clif_spawn(&md->bl);
 		}
 	}
@@ -7103,7 +7195,6 @@ void do_final_mob(bool is_reload){
 #endif // Pandas_Database_MobItem_FixedRatio
 
 	if( !is_reload ) {
-		ers_destroy(item_drop_ers);
-		ers_destroy(item_drop_list_ers);
+		mob_delayed_drops.clear();
 	}
 }

@@ -156,7 +156,7 @@ bool mail_removezeny( map_session_data *sd, bool flag ){
 			}
 		}else{
 			// Update is called by pc_payzeny, so only call it in the else condition
-			clif_updatestatus(sd, SP_ZENY);
+			clif_updatestatus(*sd, SP_ZENY);
 		}
 	}
 
@@ -193,7 +193,7 @@ enum mail_attach_result mail_setitem(map_session_data *sd, short idx, uint32 amo
 #endif
 
 		sd->mail.zeny = amount;
-		// clif_updatestatus(sd, SP_ZENY);
+		// clif_updatestatus(*sd, SP_ZENY);
 		return MAIL_ATTACH_SUCCESS;
 	} else { // Item Transfer
 		int i;
@@ -567,7 +567,7 @@ void mail_send(map_session_data *sd, const char *dest_name, const char *title, c
 		}
 
 		if (need_send_delitem) {
-			clif_delitem(sd, idx, sd->mail.item[i].amount, 0);
+			clif_delitem(*sd, idx, sd->mail.item[i].amount, 0);
 		}
 	}
 
