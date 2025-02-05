@@ -293,8 +293,16 @@ int mercenary_delete(s_mercenary_data *md, int reply) {
 
 	switch( reply )
 	{
-		case 0: mercenary_set_faith(md, 1); break; // +1 Loyalty on Contract ends.
-		case 1: mercenary_set_faith(md, -1); break; // -1 Loyalty on Mercenary killed
+		case 0:
+			// +1 Loyalty on Contract ends.
+			mercenary_set_faith(md, 1);
+			clif_msg(sd, MSI_MER_FINISH);
+			break; 
+		case 1:
+			// -1 Loyalty on Mercenary killed
+			mercenary_set_faith(md, -1);
+			clif_msg(sd, MSI_MER_DIE);
+			break; 
 	}
 
 #ifdef Pandas_NpcExpress_MER_LEAVE
@@ -308,11 +316,10 @@ int mercenary_delete(s_mercenary_data *md, int reply) {
 		pc_setreg(sd, add_str("@mer_x"), (md ? md->bl.x : 0));
 		pc_setreg(sd, add_str("@mer_y"), (md ? md->bl.y : 0));
 
-		npc_script_event(sd, NPCX_MER_LEAVE);
+		npc_script_event(*sd, NPCX_MER_LEAVE);
 	}
 #endif // Pandas_NpcExpress_MER_LEAVE
 
-	clif_mercenary_message(sd, reply);
 	return unit_remove_map(&md->bl, CLR_OUTSIGHT);
 }
 
@@ -423,7 +430,7 @@ bool mercenary_recv_data(s_mercenary *merc, bool flag)
 		pc_setreg(sd, add_str("@mer_x"), (md ? md->bl.x : 0));
 		pc_setreg(sd, add_str("@mer_y"), (md ? md->bl.y : 0));
 
-		npc_script_event(sd, NPCX_MER_CALL);
+		npc_script_event(*sd, NPCX_MER_CALL);
 	}
 #endif // Pandas_NpcExpress_MER_CALL
 
