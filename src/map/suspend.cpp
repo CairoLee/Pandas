@@ -487,11 +487,11 @@ void suspend_active(map_session_data* sd, enum e_suspend_mode smode) {
 
 	// 若正在被邀请加入队伍, 则立刻回绝
 	if (sd->party_invite > 0)
-		party_reply_invite(sd, sd->party_invite, 0);
+		party_reply_invite(*sd, sd->party_invite, 0);
 
 	// 若正在被邀请加入公会, 则立刻回绝
 	if (sd->guild_invite > 0)
-		guild_reply_invite(sd, sd->guild_invite, 0);
+		guild_reply_invite(*sd, sd->guild_invite, 0);
 
 	// 若正在被邀请创建公会同盟, 则立刻回绝
 	if (sd->guild_alliance > 0)
