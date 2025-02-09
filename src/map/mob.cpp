@@ -89,6 +89,7 @@ struct s_mob_skill_db {
 std::unordered_map<int32, std::shared_ptr<s_mob_skill_db>> mob_skill_db; /// Monster skill temporary db. s_mob_skill_db -> mobid
 
 std::unordered_map<uint32, std::shared_ptr<s_item_drop_list>> mob_delayed_drops;
+std::unordered_map<uint32, std::shared_ptr<s_item_drop_list>> mob_looted_drops;
 MobSummonDatabase mob_summon_db;
 MobChatDatabase mob_chat_db;
 MapDropDatabase map_drop_db;
@@ -202,6 +203,7 @@ void mvptomb_create(struct mob_data* md, char* killer, time_t time, int killer_g
 		mvptomb_destroy(md);
 
 	CREATE(nd, struct npc_data, 1);
+	new (nd) npc_data();
 
 	nd->bl.id = md->tomb_nid = npc_get_new_npc_id();
 
@@ -214,7 +216,7 @@ void mvptomb_create(struct mob_data* md, char* killer, time_t time, int killer_g
 	safestrncpy(nd->name, msg_txt(nullptr,656), sizeof(nd->name));
 
 	nd->class_ = 565;
-	nd->speed = 200;
+	nd->speed = DEFAULT_NPC_WALK_SPEED;
 	nd->subtype = NPCTYPE_TOMB;
 
 	nd->u.tomb.md = md;
@@ -223,6 +225,10 @@ void mvptomb_create(struct mob_data* md, char* killer, time_t time, int killer_g
 #ifdef Pandas_FuncParams_Mob_MvpTomb_Create
 	nd->u.tomb.killer_gid = killer_gid;
 #endif // Pandas_FuncParams_Mob_MvpTomb_Create
+
+	nd->dynamicnpc.owner_char_id = 0;
+	nd->dynamicnpc.last_interaction = 0;
+	nd->dynamicnpc.removal_tid = INVALID_TIMER;
 
 	if (killer)
 		safestrncpy(nd->u.tomb.killer_name, killer, NAME_LENGTH);
@@ -386,8 +392,10 @@ e_mob_bosstype s_mob_db::get_bosstype(){
 }
 
 e_mob_bosstype mob_data::get_bosstype(){
-	if( this->db != nullptr ){
-		return this->db->get_bosstype();
+	if( status_has_mode( &this->status, MD_MVP ) ){
+		return BOSSTYPE_MVP;
+	}else if( this->status.class_ == CLASS_BOSS ){
+		return BOSSTYPE_MINIBOSS;
 	}else{
 		return BOSSTYPE_NONE;
 	}
@@ -2327,24 +2335,52 @@ static std::shared_ptr<s_item_drop> mob_setlootitem( s_mob_lootitem& item, unsig
 	return drop;
 }
 
+/**
+ * Makes all items from a drop list drop
+ * @param list: list with all items that should drop
+ * @param loot: whether the items in the list are new drops or previously looted items
+ */
+void mob_process_drop_list(std::shared_ptr<s_item_drop_list>& list, bool loot)
+{
+	// First regular drop always drops at center
+	enum directions dir = DIR_CENTER;
+	// Looted drops start north instead
+	if (loot)
+		dir = DIR_NORTH;
+
+	for (std::shared_ptr<s_item_drop>& ditem : list->items) {
+		map_addflooritem(&ditem->item_data, ditem->item_data.amount,
+			list->m, list->x, list->y,
+			list->first_charid, list->second_charid, list->third_charid, 4, ditem->mob_id, !loot, dir, BL_CHAR|BL_PET);
+		// The drop location loops between three locations: SE -> W -> N -> SE
+		if (dir <= DIR_NORTH)
+			dir = DIR_SOUTHEAST;
+		else if (dir == DIR_SOUTHEAST)
+			dir = DIR_WEST;
+		else
+			dir = DIR_NORTH;
+	}
+}
+
 /*==========================================
  * item drop with delay (timer function)
  *------------------------------------------*/
-static TIMER_FUNC(mob_delay_item_drop){
-	uint32 bl_id = static_cast<uint32>( id );
-	std::shared_ptr<s_item_drop_list> list = util::umap_find( mob_delayed_drops, bl_id );
+static TIMER_FUNC(mob_delay_item_drop) {
+	uint32 bl_id = static_cast<uint32>(id);
 
-	if( list == nullptr ){
-		return 0;
+	// Regular drops
+	std::shared_ptr<s_item_drop_list> list = util::umap_find(mob_delayed_drops, bl_id);
+	if (list != nullptr) {
+		mob_process_drop_list(list, false);
+		mob_delayed_drops.erase(bl_id);
 	}
 
-	for( std::shared_ptr<s_item_drop>& ditem : list->items ){
-		map_addflooritem(&ditem->item_data,ditem->item_data.amount,
-			list->m,list->x,list->y,
-			list->first_charid,list->second_charid,list->third_charid,4,ditem->mob_id,true);
+	// Looted drops
+	list = util::umap_find(mob_looted_drops, bl_id);
+	if (list != nullptr) {
+		mob_process_drop_list(list, true);
+		mob_looted_drops.erase(bl_id);
 	}
-
-	mob_delayed_drops.erase( bl_id );
 
 	return 0;
 }
@@ -2989,6 +3025,28 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 
 	} //End EXP giving.
 
+	// Looted items have an independent drop position and also don't show special effects when dropped
+	// So we need put them into a separate list
+	std::shared_ptr<s_item_drop_list> lootlist = std::make_shared<s_item_drop_list>();
+	lootlist->m = md->bl.m;
+	lootlist->x = md->bl.x;
+	lootlist->y = md->bl.y;
+	lootlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
+	lootlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
+	lootlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
+
+	// Process items looted by the mob
+	if (md->lootitems) {
+		for (i = 0; i < md->lootitem_count; i++) {
+#ifdef Pandas_NpcExpress_MOBDROPITEM
+			if (md && !npc_express_aide_mobdropitem(md, src, lootlist, md->lootitems[i].item.nameid, 10000, 4))
+				continue;
+#endif // Pandas_NpcExpress_MOBDROPITEM
+			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+			mob_item_drop(md, lootlist, ditem, 1, 10000, homkillonly || merckillonly);
+		}
+	}
+
 	if( !(type&1) && !map_getmapflag(m, MF_NOMOBLOOT) && !md->state.rebirth && (
 		!md->special_state.ai || //Non special mob
 		battle_config.alchemist_summon_reward == 2 || //All summoned give drops
@@ -3002,7 +3060,6 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 #endif
 
 		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
-
 		dlist->m = md->bl.m;
 		dlist->x = md->bl.x;
 		dlist->y = md->bl.y;
@@ -3010,76 +3067,13 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
 		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
 
-		for (i = 0; i < MAX_MOB_DROP_TOTAL; i++) {
-			if (md->db->dropitem[i].nameid == 0)
-				continue;
-
-			std::shared_ptr<item_data> it = item_db.find(md->db->dropitem[i].nameid);
-
-			if ( it == nullptr )
-				continue;
-
-			drop_rate = mob_getdroprate(src, md->db, md->db->dropitem[i].rate, drop_modifier, md);
-
-#ifdef Pandas_Database_MobItem_FixedRatio
-			// 若严格固定掉率, 那么无视上面的等级惩罚、VIP掉率加成、地图标记掉率修正等计算
-			if (mobdrop_strict_droprate(md->db->dropitem[i].nameid, md->mob_id))
-				drop_rate = md->db->dropitem[i].rate;
-#endif // Pandas_Database_MobItem_FixedRatio
-
-			// attempt to drop the item
-			if (rnd() % 10000 >= drop_rate)
-				continue;
-
-#ifdef Pandas_NpcExpress_MOBDROPITEM
-			if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->db->dropitem[i].nameid, drop_rate, 1))
-				continue;
-#endif // Pandas_NpcExpress_MOBDROPITEM
-
-			if( mvp_sd && it->type == IT_PETEGG ) {
-				pet_create_egg(mvp_sd, md->db->dropitem[i].nameid);
-				continue;
-			}
-
-			std::shared_ptr<s_item_drop> ditem = mob_setdropitem( md->db->dropitem[i], 1, md->mob_id );
-
-#ifdef Pandas_Item_Special_Annouce
-			bool is_spceial_annouced = false;
-
-			if (mvp_sd && ditem) {
-				struct item_data* dd = itemdb_search(ditem->item_data.nameid);
-				if (ITEM_PROPERTIES_HASFLAG(dd, annouce_mask, ITEM_ANNOUCE_DROP_TO_GROUND)) {
-					char message[128] = { 0 };
-					sprintf(message, msg_txt(NULL,541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate / 100);
-					intif_broadcast(message,strlen(message)+1,BC_DEFAULT);
-					is_spceial_annouced = true;
-				}
-			}
-
-			// 若道具已经遵守 item_properties.yml 的配置被执行了公告
-			// 那么就无需再次执行 battle_config.rare_drop_announce 指定的根据掉率进行的公告策略
-			if (!is_spceial_annouced)
-#endif // Pandas_Item_Special_Annouce
-
-			//A Rare Drop Global Announce by Lupus
-			if( mvp_sd && md->db->dropitem[i].rate <= battle_config.rare_drop_announce ) {
-				char message[128];
-				sprintf (message, msg_txt(nullptr,541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate/100);
-				//MSG: "'%s' won %s's %s (chance: %0.02f%%)"
-				intif_broadcast(message,strlen(message)+1,BC_DEFAULT);
-			}
-			// Announce first, or else ditem will be freed. [Lance]
-			// By popular demand, use base drop rate for autoloot code. [Skotlex]
-			mob_item_drop(md, dlist, ditem, 0, battle_config.autoloot_adjust ? drop_rate : md->db->dropitem[i].rate, homkillonly || merckillonly);
-		}
-
 		// Ore Discovery [Celest]
 		if (sd == mvp_sd && pc_checkskill(sd,BS_FINDINGORE)>0 && battle_config.finding_ore_rate/10 >= rnd()%10000) {
 			s_mob_drop mobdrop = {};
 
-			mobdrop.nameid = itemdb_group.get_random_item_id(IG_FINDINGORE, 1);
+			mobdrop.nameid = itemdb_group.get_random_item_id(IG_FINDINGORE,1);
 
-			std::shared_ptr<s_item_drop> ditem = mob_setdropitem(mobdrop, 1, md->mob_id);
+			std::shared_ptr<s_item_drop> ditem = mob_setdropitem( mobdrop, 1, md->mob_id );
 
 #ifdef Pandas_NpcExpress_MOBDROPITEM
 			if (npc_express_aide_mobdropitem(md, src, dlist, mobdrop.nameid, battle_config.finding_ore_rate / 10, 2))
@@ -3136,22 +3130,69 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 			}
 		}
 
-		// process items looted by the mob
-		if (md->lootitems) {
-#ifndef Pandas_NpcExpress_MOBDROPITEM
-			for (i = 0; i < md->lootitem_count; i++) {
-				std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
+		// Regular mob drops drop after script-granted drops
+		for (i = 0; i < MAX_MOB_DROP_TOTAL; i++) {
+			if (md->db->dropitem[i].nameid == 0)
+				continue;
 
-				mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
-#else
-			for (i = 0; i < md->lootitem_count; i++) {
-				if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->lootitems[i].item.nameid, 10000, 4))
-					continue;
+			std::shared_ptr<item_data> it = item_db.find(md->db->dropitem[i].nameid);
 
-				std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
-				mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
-			}
+			if (it == nullptr)
+				continue;
+
+			drop_rate = mob_getdroprate(src, md->db, md->db->dropitem[i].rate, drop_modifier, md);
+
+#ifdef Pandas_Database_MobItem_FixedRatio
+			// 若严格固定掉率, 那么无视上面的等级惩罚、VIP掉率加成、地图标记掉率修正等计算
+			if (mobdrop_strict_droprate(md->db->dropitem[i].nameid, md->mob_id))
+				drop_rate = md->db->dropitem[i].rate;
+#endif // Pandas_Database_MobItem_FixedRatio
+
+			// attempt to drop the item
+			if (rnd() % 10000 >= drop_rate)
+				continue;
+
+#ifdef Pandas_NpcExpress_MOBDROPITEM
+			if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->db->dropitem[i].nameid, drop_rate, 1))
+				continue;
 #endif // Pandas_NpcExpress_MOBDROPITEM
+
+			if (mvp_sd && it->type == IT_PETEGG) {
+				pet_create_egg(mvp_sd, md->db->dropitem[i].nameid);
+				continue;
+			}
+
+			std::shared_ptr<s_item_drop> ditem = mob_setdropitem(md->db->dropitem[i], 1, md->mob_id);
+
+
+#ifdef Pandas_Item_Special_Annouce
+			bool is_spceial_annouced = false;
+
+			if (mvp_sd && ditem) {
+				struct item_data* dd = itemdb_search(ditem->item_data.nameid);
+				if (ITEM_PROPERTIES_HASFLAG(dd, annouce_mask, ITEM_ANNOUCE_DROP_TO_GROUND)) {
+					char message[128] = { 0 };
+					sprintf(message, msg_txt(NULL,541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate / 100);
+					intif_broadcast(message,strlen(message)+1,BC_DEFAULT);
+					is_spceial_annouced = true;
+				}
+			}
+
+			// 若道具已经遵守 item_properties.yml 的配置被执行了公告
+			// 那么就无需再次执行 battle_config.rare_drop_announce 指定的根据掉率进行的公告策略
+			if (!is_spceial_annouced)
+#endif // Pandas_Item_Special_Annouce
+
+			//A Rare Drop Global Announce by Lupus
+			if (mvp_sd && md->db->dropitem[i].rate <= battle_config.rare_drop_announce) {
+				char message[128];
+				sprintf(message, msg_txt(nullptr, 541), mvp_sd->status.name, md->name, it->ename.c_str(), (float)drop_rate / 100);
+				//MSG: "'%s' won %s's %s (chance: %0.02f%%)"
+				intif_broadcast(message, strlen(message) + 1, BC_DEFAULT);
+			}
+			// Announce first, or else ditem will be freed. [Lance]
+			// By popular demand, use base drop rate for autoloot code. [Skotlex]
+			mob_item_drop(md, dlist, ditem, 0, battle_config.autoloot_adjust ? drop_rate : md->db->dropitem[i].rate, homkillonly || merckillonly);
 		}
 
 		// Process map specific drops
@@ -3191,38 +3232,16 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 		}
 
 		// There are drop items.
-		if( !dlist->items.empty() ){
+		if (!dlist->items.empty() || !lootlist->items.empty()) {
 			mob_delayed_drops[md->bl.id] = dlist;
-
-			add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
+			mob_looted_drops[md->bl.id] = lootlist;
+			add_timer(tick + (!battle_config.delay_battle_damage ? 500 : 0), mob_delay_item_drop, md->bl.id, 0);
 		}
-	} else if (md->lootitems && md->lootitem_count) {	//Loot MUST drop!
-		std::shared_ptr<s_item_drop_list> dlist = std::make_shared<s_item_drop_list>();
-
-		dlist->m = md->bl.m;
-		dlist->x = md->bl.x;
-		dlist->y = md->bl.y;
-		dlist->first_charid = (mvp_sd ? mvp_sd->status.char_id : 0);
-		dlist->second_charid = (second_sd ? second_sd->status.char_id : 0);
-		dlist->third_charid = (third_sd ? third_sd->status.char_id : 0);
-
-#ifndef Pandas_NpcExpress_MOBDROPITEM
-		for (i = 0; i < md->lootitem_count; i++) {
-			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
-
-			mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
-#else
-		for (i = 0; i < md->lootitem_count; i++) {
-			if (md && !npc_express_aide_mobdropitem(md, src, dlist, md->lootitems[i].item.nameid, 10000, 4))
-				continue;
-
-			std::shared_ptr<s_item_drop> ditem = mob_setlootitem(md->lootitems[i], md->mob_id);
-			mob_item_drop( md, dlist, ditem, 1, 10000, homkillonly || merckillonly );
-		}
-#endif // Pandas_NpcExpress_MOBDROPITEM
-
-		mob_delayed_drops[md->bl.id] = dlist;
-		add_timer( tick + ( !battle_config.delay_battle_damage ? 500 : 0 ), mob_delay_item_drop, md->bl.id, 0 );
+	}
+	// Loot MUST drop!
+	else if (!lootlist->items.empty()) {
+		mob_looted_drops[md->bl.id] = lootlist;
+		add_timer(tick + (!battle_config.delay_battle_damage ? 500 : 0), mob_delay_item_drop, md->bl.id, 0);
 	}
 
 	if( mvp_sd && md->get_bosstype() == BOSSTYPE_MVP ){
@@ -3350,7 +3369,7 @@ int mob_dead(struct mob_data *md, struct block_list *src, int type, uint16 skill
 
 				if((temp = pc_additem(mvp_sd,&item,1,LOG_TYPE_PICKDROP_PLAYER)) != 0) {
 					clif_additem(mvp_sd,0,0,temp);
-					map_addflooritem(&item,1,mvp_sd->bl.m,mvp_sd->bl.x,mvp_sd->bl.y,mvp_sd->status.char_id,(second_sd?second_sd->status.char_id:0),(third_sd?third_sd->status.char_id:0),1,0,true);
+					map_addflooritem(&item,1,mvp_sd->bl.m,mvp_sd->bl.x,mvp_sd->bl.y,mvp_sd->status.char_id,(second_sd?second_sd->status.char_id:0),(third_sd?third_sd->status.char_id:0),1,0,true,DIR_CENTER);
 				}
 
 				if (i_data->flag.broadcast)
@@ -3723,7 +3742,6 @@ int mob_class_change (struct mob_data *md, int mob_id)
 	status_set_viewdata(&md->bl, mob_id);
 	clif_mob_class_change(md,md->vd->class_);
 	status_calc_mob(md,SCO_FIRST);
-	md->ud.state.speed_changed = 1; //Speed change update.
 
 	if (battle_config.monster_class_change_recover) {
 		memset(md->dmglog, 0, sizeof(md->dmglog));
